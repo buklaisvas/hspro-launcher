@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# HS Pro installer launcher (no secrets inside - public).
+#   Customer one-liner:   curl -fsSL https://hspro-license.buklaisvas.workers.dev/install | bash
+# It asks for your username (license), checks it against the license server (username + this server's IP),
+# downloads the installer and starts the setup wizard.
+# Optional flags (after "bash -s --"): --license NICK  --domain D  --ns D  --yes  --no-save  --url URL  --download-only DIR
+set -euo pipefail
+LICENSE_URL="https://hspro-license.buklaisvas.workers.dev"
+ASSET="hspro-installer.run"
+
+download_release() {   # url key outdir
+  local url="$1" key="$2" out="$3" code
+  mkdir -p "$out"
+  for f in "$ASSET" "$ASSET.sha256"; do
+    code=$(curl -4 -sS --max-time 600 -H "X-License-Key: $key" -o "$out/$f" -w '%{http_code}' "$url/v1/file/$f" </dev/null) || code=000
+    if [ "$code" != "200" ]; then
+      echo "ERROR: download of $f refused/failed (HTTP $code)"; head -c 300 "$out/$f" 2>/dev/null; echo; return 1
+    fi
+  done
+  local want have
+  want=$(awk '{print $1}' "$out/$ASSET.sha256"); have=$(sha256sum "$out/$ASSET" | awk '{print $1}')
+  [ "$want" = "$have" ] || { echo "ERROR: SHA256 mismatch, aborting"; return 1; }
+  echo "[*] Download OK, SHA256 verified"
+  chmod 700 "$out/$ASSET"
+}
+
+check_key() {   # url key -> 0 if license valid for this server's IP; prints a message
+  local resp err ip c e
+  resp=$(curl -4 -sS --max-time 20 -H "X-License-Key: $2" "$1/v1/check" </dev/null 2>&1) || true
+  if grep -q '"ok":true' <<<"$resp"; then
+    c=$(sed -n 's/.*"client":"\([^"]*\)".*/\1/p' <<<"$resp"); e=$(sed -n 's/.*"exp":"\([^"]*\)".*/\1/p' <<<"$resp")
+    echo "License OK: $c, valid until $e"; return 0
+  fi
+  err=$(sed -n 's/.*"error":"\([^"]*\)".*/\1/p' <<<"$resp"); ip=$(sed -n 's/.*"ip":"\([^"]*\)".*/\1/p' <<<"$resp")
+  echo "License check failed: ${err:-no valid response from license server}"
+  [ -z "$ip" ] || echo "This server's IP as seen by the license server: $ip"
+  return 1
+}
+
+main() {
+  local KEY="" SAVE=1 DLONLY="" HAVE_TTY=0 PASS=() try WORK
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --license) KEY="$2"; shift 2;;
+      --url) LICENSE_URL="$2"; shift 2;;
+      --save) SAVE=1; shift;;
+      --no-save) SAVE=0; shift;;
+      --download-only) DLONLY="$2"; shift 2;;
+      *) PASS+=("$1"); shift;;
+    esac
+  done
+  [ "$(id -u)" = "0" ] || { echo "ERROR: run as root (use: curl -fsSL .../install | sudo bash)"; return 1; }
+  case "$LICENSE_URL" in http*) ;; *) echo "ERROR: license server URL missing (--url)"; return 1;; esac
+  if ! command -v curl >/dev/null; then apt-get update -y </dev/null >/dev/null 2>&1 || true; apt-get install -y curl </dev/null >/dev/null 2>&1 || true; fi
+  command -v curl >/dev/null || { echo "ERROR: curl required"; return 1; }
+  { true </dev/tty; } 2>/dev/null && HAVE_TTY=1
+
+  if [ -z "$KEY" ]; then
+    [ "$HAVE_TTY" = 1 ] || { echo "ERROR: no terminal to ask for the username. Re-run with: --license YOUR_USERNAME"; return 1; }
+    echo "=== HS Pro installer ==="
+    echo "This server's IP: $(curl -4 -fsS --max-time 15 "$LICENSE_URL/v1/ip" </dev/null 2>/dev/null || echo unknown)"
+    for try in 1 2 3; do
+      read -r -p "Username: " KEY </dev/tty
+      KEY=$(printf '%s' "$KEY" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+      if [ -n "$KEY" ] && check_key "$LICENSE_URL" "$KEY"; then break; fi
+      KEY=""; echo "Try again ($try/3)"
+    done
+    [ -n "$KEY" ] || { echo "Aborted: no valid license for this server."; return 1; }
+  else
+    check_key "$LICENSE_URL" "$KEY" || return 1
+  fi
+
+  if [ -n "$DLONLY" ]; then download_release "$LICENSE_URL" "$KEY" "$DLONLY"; return $?; fi
+  WORK=$(mktemp -d /root/hspro-dl.XXXXXX); trap "rm -rf '$WORK'" EXIT
+  download_release "$LICENSE_URL" "$KEY" "$WORK" || return 1
+
+  if [ "$SAVE" = "1" ]; then
+    mkdir -p /etc/hspro
+    ( umask 077; printf 'LICENSE_URL=%q\nKEY=%q\n' "$LICENSE_URL" "$KEY" > /etc/hspro/license.conf )
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'set -euo pipefail'
+      echo "ASSET=\"$ASSET\""
+      declare -f download_release
+      cat <<'UPD'
+# hspro-update : re-downloads the latest release (license is checked by the server) and reinstalls
+[ "$(id -u)" = "0" ] || { echo "run as root"; exit 1; }
+. /etc/hspro/license.conf
+W=$(mktemp -d /root/hspro-up.XXXXXX); trap 'rm -rf "$W"' EXIT
+download_release "$LICENSE_URL" "$KEY" "$W"
+bash "$W/$ASSET" --yes --no-setup </dev/null
+systemctl restart asv2-ws asv2-mux asv2-api 2>/dev/null || true
+echo "Update finished."
+UPD
+    } > /usr/local/bin/hspro-update
+    chmod 700 /usr/local/bin/hspro-update
+    echo "[*] Installed 'hspro-update'"
+  fi
+
+  # hand the real terminal to the installer so its confirmation prompt and setup wizard work even under "curl | bash"
+  if [ "$HAVE_TTY" = 1 ]; then
+    bash "$WORK/$ASSET" --license "$KEY" ${PASS[@]+"${PASS[@]}"} </dev/tty
+  else
+    bash "$WORK/$ASSET" --license "$KEY" ${PASS[@]+"${PASS[@]}"} </dev/null
+  fi
+}
+
+main "$@"
+exit $?
