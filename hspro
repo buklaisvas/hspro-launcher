@@ -7,12 +7,24 @@
 set -euo pipefail
 LICENSE_URL="https://hspro-license.buklaisvas.workers.dev"
 ASSET="hspro-installer.run"
+hs_tmp(){ # hidden, RAM-backed (tmpfs) 0700 work dir: nothing visible in /root or /tmp listings, nothing left on disk
+  local d b
+  for b in /dev/shm /run /var/tmp /tmp; do
+    [ -d "$b" ] && [ -w "$b" ] || continue
+    d=$(mktemp -d "$b/.XXXXXXXXXX" 2>/dev/null) || continue
+    chmod 700 "$d"
+    printf '#!/bin/sh\nexit 0\n' > "$d/.t"; chmod +x "$d/.t"
+    if "$d/.t" 2>/dev/null && [ "$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print $4}')" -ge 153600 ]; then rm -f "$d/.t"; echo "$d"; return 0; fi
+    rm -rf "$d"
+  done
+  return 1
+}
 
 download_release() {   # url key outdir
   local url="$1" key="$2" out="$3" code
   mkdir -p "$out"
   for f in "$ASSET" "$ASSET.sha256"; do
-    code=$(curl -4 -sS --max-time 600 -H "X-License-Key: $key" -o "$out/$f" -w '%{http_code}' "$url/v1/file/$f" </dev/null) || code=000
+    code=$(printf 'header = "X-License-Key: %s"\n' "$key" | curl -4 -sS --max-time 600 -K - -o "$out/$f" -w '%{http_code}' "$url/v1/file/$f") || code=000
     if [ "$code" != "200" ]; then
       echo "ERROR: download of $f refused/failed (HTTP $code)"; head -c 300 "$out/$f" 2>/dev/null; echo; return 1
     fi
@@ -26,7 +38,7 @@ download_release() {   # url key outdir
 
 check_key() {   # url key -> 0 if license valid for this server's IP; prints a message
   local resp err ip c e
-  resp=$(curl -4 -sS --max-time 20 -H "X-License-Key: $2" "$1/v1/check" </dev/null 2>&1) || true
+  resp=$(printf 'header = "X-License-Key: %s"\n' "$2" | curl -4 -sS --max-time 20 -K - "$1/v1/check" 2>&1) || true
   if grep -q '"ok":true' <<<"$resp"; then
     c=$(sed -n 's/.*"client":"\([^"]*\)".*/\1/p' <<<"$resp"); e=$(sed -n 's/.*"exp":"\([^"]*\)".*/\1/p' <<<"$resp")
     echo "License OK: $c, valid until $e"; return 0
@@ -71,7 +83,7 @@ main() {
   fi
 
   if [ -n "$DLONLY" ]; then download_release "$LICENSE_URL" "$KEY" "$DLONLY"; return $?; fi
-  WORK=$(mktemp -d /root/hspro-dl.XXXXXX); trap "rm -rf '$WORK'" EXIT
+  WORK=$(hs_tmp || mktemp -d /root/.hs.XXXXXX); trap "rm -rf '$WORK'" EXIT
   download_release "$LICENSE_URL" "$KEY" "$WORK" || return 1
 
   if [ "$SAVE" = "1" ]; then
@@ -81,12 +93,13 @@ main() {
       echo '#!/usr/bin/env bash'
       echo 'set -euo pipefail'
       echo "ASSET=\"$ASSET\""
+      declare -f hs_tmp
       declare -f download_release
       cat <<'UPD'
 # hspro-update : re-downloads the latest release (license is checked by the server) and reinstalls
 [ "$(id -u)" = "0" ] || { echo "run as root"; exit 1; }
 . /etc/hspro/license.conf
-W=$(mktemp -d /root/hspro-up.XXXXXX); trap 'rm -rf "$W"' EXIT
+W=$(hs_tmp || mktemp -d /root/.hs.XXXXXX); trap 'rm -rf "$W"' EXIT
 download_release "$LICENSE_URL" "$KEY" "$W"
 bash "$W/$ASSET" --yes --no-setup </dev/null
 systemctl restart asv2-ws asv2-mux asv2-api 2>/dev/null || true
