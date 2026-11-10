@@ -112,9 +112,9 @@ UPD
 
   # hand the real terminal to the installer so its confirmation prompt and setup wizard work even under "curl | bash"
   if [ "$HAVE_TTY" = 1 ]; then
-    bash "$WORK/$ASSET" --license "$KEY" ${PASS[@]+"${PASS[@]}"} </dev/tty
+    bash "$WORK/$ASSET" --yes --license "$KEY" ${PASS[@]+"${PASS[@]}"} </dev/tty
   else
-    bash "$WORK/$ASSET" --license "$KEY" ${PASS[@]+"${PASS[@]}"} </dev/null
+    bash "$WORK/$ASSET" --yes --license "$KEY" ${PASS[@]+"${PASS[@]}"} </dev/null
   fi
 }
 
